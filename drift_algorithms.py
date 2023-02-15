@@ -34,7 +34,115 @@ def chain(fixation_XY, line_Y, x_thresh=192, y_thresh=32):
 		start_of_chain = end_of_chain
 	return fixation_XY
 
+######################################################################
+# CLUSTER
+# 
+# https://github.com/sascha2schroeder/popEye/
+######################################################################
 
+def cluster(fixation_XY, line_Y):
+	m = len(line_Y)
+	fixation_Y = fixation_XY[:, 1].reshape(-1, 1)
+	clusters = KMeans(m, n_init=100, max_iter=300).fit_predict(fixation_Y)
+	centers = [fixation_Y[clusters == i].mean() for i in range(m)]
+	ordered_cluster_indices = np.argsort(centers)
+	for fixation_i, cluster_i in enumerate(clusters):
+		line_i = np.where(ordered_cluster_indices == cluster_i)[0][0]
+		fixation_XY[fixation_i, 1] = line_Y[line_i]
+	return fixation_XY
+
+######################################################################
+# COMPARE
+#
+# Lima Sanches, C., Kise, K., & Augereau, O. (2015). Eye gaze and text
+#   line matching for reading analysis. In Adjunct proceedings of the
+#   2015 ACM International Joint Conference on Pervasive and
+#   Ubiquitous Computing and proceedings of the 2015 ACM International
+#   Symposium on Wearable Computers (pp. 1227–1233). Association for
+#   Computing Machinery.
+#
+# https://doi.org/10.1145/2800835.2807936
+######################################################################
+
+def compare(fixation_XY, word_XY, x_thresh=512, n_nearest_lines=3):
+	line_Y = np.unique(word_XY[:, 1])
+	n = len(fixation_XY)
+	diff_X = np.diff(fixation_XY[:, 0])
+	end_line_indices = list(np.where(diff_X < -x_thresh)[0] + 1)
+	end_line_indices.append(n)
+	start_of_line = 0
+	for end_of_line in end_line_indices:
+		gaze_line = fixation_XY[start_of_line:end_of_line]
+		mean_y = np.mean(gaze_line[:, 1])
+		lines_ordered_by_proximity = np.argsort(abs(line_Y - mean_y))
+		nearest_line_I = lines_ordered_by_proximity[:n_nearest_lines]
+		line_costs = np.zeros(n_nearest_lines)
+		for candidate_i in range(n_nearest_lines):
+			candidate_line_i = nearest_line_I[candidate_i]
+			text_line = word_XY[word_XY[:, 1] == line_Y[candidate_line_i]]
+			dtw_cost, _ = dynamic_time_warping(gaze_line[:, 0:1], text_line[:, 0:1])
+			line_costs[candidate_i] = dtw_cost
+		line_i = nearest_line_I[np.argmin(line_costs)]
+		fixation_XY[start_of_line:end_of_line, 1] = line_Y[line_i]
+		start_of_line = end_of_line
+	return fixation_XY
+
+######################################################################
+# MERGE
+#
+# Špakov, O., Istance, H., Hyrskykari, A., Siirtola, H., & Räihä,
+#   K.-J. (2019). Improving the performance of eye trackers with
+#   limited spatial accuracy and low sampling rates for reading
+#   analysis by heuristic fixation-to-word mapping. Behavior Research
+#   Methods, 51(6), 2661–2687.
+#
+# https://doi.org/10.3758/s13428-018-1120-x
+# https://github.com/uta-gasp/sgwm
+######################################################################
+
+phases = [{'min_i':3, 'min_j':3, 'no_constraints':False}, # Phase 1
+          {'min_i':1, 'min_j':3, 'no_constraints':False}, # Phase 2
+          {'min_i':1, 'min_j':1, 'no_constraints':False}, # Phase 3
+          {'min_i':1, 'min_j':1, 'no_constraints':True}]  # Phase 4
+
+def merge(fixation_XY, line_Y, y_thresh=32, g_thresh=0.1, e_thresh=20):
+	n = len(fixation_XY)
+	m = len(line_Y)
+	diff_X = np.diff(fixation_XY[:, 0])
+	dist_Y = abs(np.diff(fixation_XY[:, 1]))
+	sequence_boundaries = list(np.where(np.logical_or(diff_X < 0, dist_Y > y_thresh))[0] + 1)
+	sequence_starts = [0] + sequence_boundaries
+	sequence_ends = sequence_boundaries + [n]
+	sequences = [list(range(start, end)) for start, end in zip(sequence_starts, sequence_ends)]
+	for phase in phases:
+		while len(sequences) > m:
+			best_merger = None
+			best_error = np.inf
+			for i in range(len(sequences)-1):
+				if len(sequences[i]) < phase['min_i']:
+					continue # first sequence too short, skip to next i
+				for j in range(i+1, len(sequences)):
+					if len(sequences[j]) < phase['min_j']:
+						continue # second sequence too short, skip to next j
+					candidate_XY = fixation_XY[sequences[i] + sequences[j]]
+					gradient, intercept = np.polyfit(candidate_XY[:, 0], candidate_XY[:, 1], 1)
+					residuals = candidate_XY[:, 1] - (gradient * candidate_XY[:, 0] + intercept)
+					error = np.sqrt(sum(residuals**2) / len(candidate_XY))
+					if phase['no_constraints'] or (abs(gradient) < g_thresh and error < e_thresh):
+						if error < best_error:
+							best_merger = (i, j)
+							best_error = error
+			if best_merger is None:
+				break # no possible mergers, break while and move to next phase
+			merge_i, merge_j = best_merger
+			merged_sequence = sequences[merge_i] + sequences[merge_j]
+			sequences.append(merged_sequence)
+			del sequences[merge_j], sequences[merge_i]
+	mean_Y = [fixation_XY[sequence, 1].mean() for sequence in sequences]
+	ordered_sequence_indices = np.argsort(mean_Y)
+	for line_i, sequence_i in enumerate(ordered_sequence_indices):
+		fixation_XY[sequences[sequence_i], 1] = line_Y[line_i]
+	return fixation_XY
 
 ######################################################################
 # REGRESS
@@ -72,6 +180,85 @@ def regress(fixation_XY, line_Y, k_bounds=(-0.1, 0.1), o_bounds=(-50, 50), s_bou
 	return fixation_XY
 
 ######################################################################
+# SEGMENT
+#
+# Abdulin, E. R., & Komogortsev, O. V. (2015). Person verification via
+#   eye movement-driven text reading model, In 2015 IEEE 7th
+#   International Conference on Biometrics Theory, Applications and
+#   Systems. IEEE.
+#
+# https://doi.org/10.1109/BTAS.2015.7358786
+######################################################################
+
+def segment(fixation_XY, line_Y):
+	n = len(fixation_XY)
+	m = len(line_Y)
+	diff_X = np.diff(fixation_XY[:, 0])
+	saccades_ordered_by_length = np.argsort(diff_X)
+	line_change_indices = saccades_ordered_by_length[:m-1]
+	current_line_i = 0
+	for fixation_i in range(n):
+		fixation_XY[fixation_i, 1] = line_Y[current_line_i]
+		if fixation_i in line_change_indices:
+			current_line_i += 1
+	return fixation_XY
+
+######################################################################
+# SPLIT
+#
+# Carr, J. W., Pescuma, V. N., Furlan, M., Ktori, M., & Crepaldi, D.
+#   (2021). Algorithms for the automated correction of vertical drift
+#   in eye-tracking data. Behavior Research Methods.
+#
+# https://doi.org/10.3758/s13428-021-01554-0
+# https://github.com/jwcarr/drift
+######################################################################
+
+def split(fixation_XY, line_Y):
+	n = len(fixation_XY)
+	diff_X = np.diff(fixation_XY[:, 0])
+	clusters = KMeans(2, n_init=10, max_iter=300).fit_predict(diff_X.reshape(-1, 1))
+	centers = [diff_X[clusters == 0].mean(), diff_X[clusters == 1].mean()]
+	sweep_marker = np.argmin(centers)
+	end_line_indices = list(np.where(clusters == sweep_marker)[0] + 1)
+	end_line_indices.append(n)
+	start_of_line = 0
+	for end_of_line in end_line_indices:
+		mean_y = np.mean(fixation_XY[start_of_line:end_of_line, 1])
+		line_i = np.argmin(abs(line_Y - mean_y))
+		fixation_XY[start_of_line:end_of_line, 1] = line_Y[line_i]
+		start_of_line = end_of_line
+	return fixation_XY
+
+######################################################################
+# STRETCH
+#
+# Lohmeier, S. (2015). Experimental evaluation and modelling of the
+#   comprehension of indirect anaphors in a programming language
+#   (Master’s thesis). Technische Universität Berlin.
+#
+# http://www.monochromata.de/master_thesis/ma1.3.pdf
+######################################################################
+
+def stretch(fixation_XY, line_Y, scale_bounds=(0.9, 1.1), offset_bounds=(-50, 50)):
+	n = len(fixation_XY)
+	fixation_Y = fixation_XY[:, 1]
+
+	def fit_lines(params, return_correction=False):
+		candidate_Y = fixation_Y * params[0] + params[1]
+		corrected_Y = np.zeros(n)
+		for fixation_i in range(n):
+			line_i = np.argmin(abs(line_Y - candidate_Y[fixation_i]))
+			corrected_Y[fixation_i] = line_Y[line_i]
+		if return_correction:
+			return corrected_Y
+		return sum(abs(candidate_Y - corrected_Y))
+
+	best_fit = minimize(fit_lines, [1, 0], bounds=[scale_bounds, offset_bounds])
+	fixation_XY[:, 1] = fit_lines(best_fit.x, return_correction=True)
+	return fixation_XY
+
+######################################################################
 # WARP
 #
 # Carr, J. W., Pescuma, V. N., Furlan, M., Ktori, M., & Crepaldi, D.
@@ -83,32 +270,99 @@ def regress(fixation_XY, line_Y, k_bounds=(-0.1, 0.1), o_bounds=(-50, 50), s_bou
 ######################################################################
 
 def warp(fixation_XY, word_XY):
+	# Call the dynamic time warping (dtw) function to find the best path between the two sequences
+    # dtw_path stores the mapping between fixations and words
+
 	_, dtw_path = dynamic_time_warping(fixation_XY, word_XY)
+
+	# For each fixation, find the corresponding words and calculate the mode of their Y values
 	for fixation_i, words_mapped_to_fixation_i in enumerate(dtw_path):
+		# The Y values of the corresponding words
 		candidate_Y = word_XY[words_mapped_to_fixation_i, 1]
+		# The mode of the Y values of the corresponding words
+        # is assigned as the Y value of the current fixation
 		fixation_XY[fixation_i, 1] = mode(candidate_Y)
+
+	# Return the corrected fixation data
 	return fixation_XY
 
+# Extension - Creating a version of the warp function that detects regressions and adapts to them
+def warp_with_regression(fixation_XY, word_XY):
+		
+	# TODO: Implement the regression detection and adaptation
+
+	_, dtw_path = dynamic_time_warping(fixation_XY, word_XY)
+
+	# For each fixation, find the corresponding words and calculate the mode of their Y values
+	for fixation_i, words_mapped_to_fixation_i in enumerate(dtw_path):
+		# The Y values of the corresponding words
+		candidate_Y = word_XY[words_mapped_to_fixation_i, 1]
+		# The mode of the Y values of the corresponding words
+        # is assigned as the Y value of the current fixation
+		fixation_XY[fixation_i, 1] = mode(candidate_Y)
+
+	# Return the corrected fixation data
+	return fixation_XY
+
+# Function to double the length of the fixation sequence by inserting a fixation at the midpoint of each fixation
+def double_fixation_length(fixation_XY):
+	# Finding the number of fixations in the sequence
+	n = len(fixation_XY)
+
+	# Creating a new fixation sequence with double the number of fixations
+	new_fixation_XY = np.zeros((2*n, 3))
+
+	# Looping through the fixations and adding them to the new sequence
+	for fixation_i in range(n):
+		# Adding the current fixation to the new sequence
+		new_fixation_XY[2*fixation_i] = fixation_XY[fixation_i]
+
+		# If the current fixation is not the last fixation in the sequence
+		if fixation_i != n-1:
+			# Finding the midpoint between the current fixation and the next fixation
+			midpoint = (fixation_XY[fixation_i] + fixation_XY[fixation_i+1])/2
+
+			# Adding the midpoint fixation to the new sequence
+			new_fixation_XY[2*fixation_i + 1] = midpoint
+
+	# Returning the new fixation sequence
+	return new_fixation_XY
+
+
+
+
+# The mode function is used to find the most frequent value in a list
 def mode(values):
+	# Convert the input values to a list
 	values = list(values)
+	# Return the most frequent value in the list
 	return max(set(values), key=values.count)
 
 
 def time_warp(fixation_XY, word_XY):
-    
+    # Remove the durations from the fixation data
     durations = np.delete(fixation_XY, 0, 1)
     durations = np.delete(durations, 0, 1)
     fixation_XY = np.delete(fixation_XY, 2, 1)
 
+    # Remove the durations from the word data
     word_durations = np.delete(word_XY, 0, 1)
     word_durations = np.delete(word_durations, 0, 1)
     word_XY = np.delete(word_XY, 2, 1)
     
+	# Call the dynamic time warping (dtw) function to find the best path between the two sequences
+    # dtw_path stores the mapping between fixations and words
     _, dtw_path = dynamic_time_warping(durations, word_durations)
 
+    # For each fixation, find the corresponding words and calculate the mode of their Y values
     for fixation_i, words_mapped_to_fixation_i in enumerate(dtw_path):
+		# The Y values of the corresponding words
         candidate_Y = word_XY[words_mapped_to_fixation_i, 1]
+		# The mode of the Y values of the corresponding words
+        # is assigned as the Y value of the current fixation
         fixation_XY[fixation_i, 1] = mode(candidate_Y)
+
+	# Return the corrected fixation data
     return fixation_XY
 
 
