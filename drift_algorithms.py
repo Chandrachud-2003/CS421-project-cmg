@@ -287,9 +287,16 @@ def warp(fixation_XY, word_XY):
 	return fixation_XY
 
 # Extension - Creating a version of the warp function that detects regressions and adapts to them
-def warp_with_regression(fixation_XY, word_XY):
+def warp_with_regression(fixation_XY, word_XY, words_sorted, aoi_lines, correct_data):
 		
-	# TODO: Implement the regression detection and adaptation
+	# Filtering the fixation data to remove the regressions
+	fixation_XY, correct_data = filter_out_regressions(fixation_XY, words_sorted, aoi_lines, correct_data)
+
+	fixation_XY = np.array(fixation_XY.copy(), dtype=int)
+	durations = np.delete(fixation_XY, 0, 1)
+	durations = np.delete(durations, 0, 1)
+	fixation_XY = np.delete(fixation_XY, 2, 1)
+
 
 	_, dtw_path = dynamic_time_warping(fixation_XY, word_XY)
 
@@ -302,34 +309,7 @@ def warp_with_regression(fixation_XY, word_XY):
 		fixation_XY[fixation_i, 1] = mode(candidate_Y)
 
 	# Return the corrected fixation data
-	return fixation_XY
-
-# Function to double the length of the fixation sequence by inserting a fixation at the midpoint of each fixation
-def double_fixation_length(fixation_XY):
-	# Finding the number of fixations in the sequence
-	n = len(fixation_XY)
-
-	# Creating a new fixation sequence with double the number of fixations
-	new_fixation_XY = np.zeros((2*n, 3))
-
-	# Looping through the fixations and adding them to the new sequence
-	for fixation_i in range(n):
-		# Adding the current fixation to the new sequence
-		new_fixation_XY[2*fixation_i] = fixation_XY[fixation_i]
-
-		# If the current fixation is not the last fixation in the sequence
-		if fixation_i != n-1:
-			# Finding the midpoint between the current fixation and the next fixation
-			midpoint = (fixation_XY[fixation_i] + fixation_XY[fixation_i+1])/2
-
-			# Adding the midpoint fixation to the new sequence
-			new_fixation_XY[2*fixation_i + 1] = midpoint
-
-	# Returning the new fixation sequence
-	return new_fixation_XY
-
-
-
+	return fixation_XY, correct_data
 
 # The mode function is used to find the most frequent value in a list
 def mode(values):
@@ -403,3 +383,45 @@ def dynamic_time_warping(sequence1, sequence2):
 			j -= 1
 	dtw_path[0].append(0)
 	return dtw_cost[-1, -1], dtw_path
+
+def filter_out_regressions(fixations, words_sorted, aoi_lines, correct_data):
+	'''Filters out regression fixations from the list of fixations'''
+
+	new_fixations = [] # creates an empty list `new_fixations` to store the non-regression fixations
+
+	new_corrected_data = [] # creates an empty list `new_corrected_data` to store the non-regression fixations
+
+	# Variable to store the current line number
+	line_number = 0
+    
+	for i, fix in enumerate(fixations): # loop through the list of fixations
+		x, y, duration = fix[0], fix[1], fix[2] # unpack the values from each fixation
+
+		# Use the aoi_lines to determine when to increment the line number
+		if y > aoi_lines.at[line_number, 'y'] + aoi_lines.at[line_number, 'height']:
+			line_number += 1
+
+		is_regression = False # initialize the `is_regression` flag as False
+
+		# check if this fixation is a regression within line
+		words_on_line = words_sorted[line_number]
+		recent_words = [word for word in words_on_line if word[0] < x]
+		if len(recent_words) > 0:
+			last_word_x, last_word_y = recent_words[-1][0], recent_words[-1][1]
+			if x < last_word_x:
+				is_regression = True
+
+		# check if this fixation is a regression between lines
+		if not is_regression and line_number > 0:
+			for j in range(i-1, -1, -1):
+				prev_x, prev_y = fixations[j][0], fixations[j][1]
+				if prev_y <= y and y <= aoi_lines.at[line_number, 'y']:
+					# we found a fixation on the previous line, so this must be a regression
+					is_regression = True
+					break
+
+		if not is_regression: # if this fixation is not a regression, add it to the new list of fixations
+			new_fixations.append([x, y, duration])
+			new_corrected_data.append(correct_data[i])
+
+	return new_fixations, new_corrected_data # return the final list of non-regression fixations
